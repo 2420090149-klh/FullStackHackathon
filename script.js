@@ -207,17 +207,13 @@ document.addEventListener('DOMContentLoaded', () => {
     generateBtn.addEventListener('click', async () => {
         const promptText = promptInput.value.trim();
         if(!promptText) {
-            alert("Please enter a topic to generate a lecture.");
+            alert("Please enter a presentation topic.");
             return;
         }
 
-        if(!GEMINI_API_KEY) {
-            alert("Please click the settings icon (top right) and enter your Gemini API Key first to enable dynamic generation.");
-            settingsModal.classList.remove('hidden');
-            return;
-        }
-
-        // Setup loading screen
+        // We no longer strictly block if there is no API key! We will use the free Pollinations AI fallback.
+        
+        // Hide Home, Show Loading
         homeView.classList.add('hidden');
         loadingView.style.display = 'flex';
         loadingView.classList.remove('hidden');
@@ -326,27 +322,60 @@ Structure expected:
             body: JSON.stringify(payload)
         };
 
-        // Aggressive Waterfall Model Fetching to gracefully handle Region Restrictions!
-        let response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, fetchOptions);
-        
-        if (response.status === 404) {
-            console.warn("Flash model unavailable (404). Falling back to gemini-1.5-pro...");
-            response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${GEMINI_API_KEY}`, fetchOptions);
+        const endpointsToTry = [
+            "v1beta/models/gemini-1.5-flash",
+            "v1/models/gemini-1.5-flash",
+            "v1beta/models/gemini-1.5-flash-latest",
+            "v1beta/models/gemini-1.5-pro",
+            "v1beta/models/gemini-2.0-flash",
+            "v1beta/models/gemini-pro"
+        ];
+
+        let finalResponse = null;
+        let lastErrorText = "Unknown API Error";
+
+        // If we have an API key, try Gemini's endpoints first
+        if (GEMINI_API_KEY) {
+            for (const endpoint of endpointsToTry) {
+                let currentPayload = payload;
+                if (endpoint.includes('gemini-pro') && !endpoint.includes('1.5')) {
+                    currentPayload = { contents: [{ parts: [{ text: systemPrompt + "\\n\\nUser Topic: " + userPrompt }] }] };
+                }
+                fetchOptions.body = JSON.stringify(currentPayload);
+
+                try {
+                    const response = await fetch(`https://generativelanguage.googleapis.com/${endpoint}:generateContent?key=${GEMINI_API_KEY}`, fetchOptions);
+                    if (response.ok) {
+                        finalResponse = response;
+                        break; 
+                    } else {
+                        const errPayload = await response.clone().json().catch(() => ({}));
+                        if (errPayload.error && errPayload.error.message) {
+                            lastErrorText = errPayload.error.message;
+                        }
+                    }
+                } catch (e) {
+                    console.warn("Network error attempting endpoint: " + endpoint);
+                }
+            }
         }
 
-        if (response.status === 404) {
-            console.warn("1.5 Pro unavailable (404). Falling back to base gemini-pro...");
-            // base gemini-pro sometimes requires stripping inline_data to avoid 400s if it doesn't support vision
-            const textOnlyPayload = { contents: [{ parts: [{ text: systemPrompt + "\\n\\nUser Topic: " + userPrompt }] }] };
-            fetchOptions.body = JSON.stringify(textOnlyPayload);
-            response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${GEMINI_API_KEY}`, fetchOptions);
+        // If Gemini failed (or no key was provided), fallback to entirely free Pollinations Text AI!
+        if (!finalResponse || !finalResponse.ok) {
+            console.warn("Gemini unavailable or missing. Falling back to keyless Pollinations AI Text generation...");
+            const pollinationsUrl = `https://text.pollinations.ai/prompt/${encodeURIComponent(systemPrompt + "\\n\\nUser Topic: " + userPrompt)}?jsonMode=true&seed=${Math.floor(Math.random()*1000)}`;
+            
+            const fallbackResponse = await fetch(pollinationsUrl);
+            if (!fallbackResponse.ok) {
+                throw new Error("Both Gemini and the Keyless Pollinations Fallback failed to generate text.");
+            }
+            
+            const textResponse = await fallbackResponse.text();
+            return textResponse; // Pollinations returns the raw text directly!
         }
 
-        if(!response.ok) {
-            throw new Error(`Gemini API Error: ${response.status} ${response.statusText}`);
-        }
-
-        const data = await response.json();
+        // If Gemini succeeded, parse its specific structure
+        const data = await finalResponse.json();
         
         if (!data.candidates || data.candidates.length === 0 || !data.candidates[0].content) {
             throw new Error("Gemini returned an empty or blocked response. It may have hit safety filters.");
